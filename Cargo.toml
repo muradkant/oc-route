@@ -1,0 +1,26 @@
+[package]
+name = "oc-route"
+version = "0.1.0"
+edition = "2021"
+description = "OpenCode Model Router — a Rust proxy that routes each message to the optimal LLM based on user-defined natural language rules."
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+anyhow = "1"
+dirs = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
