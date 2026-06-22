@@ -136,6 +136,8 @@ RouteLLM (LMSYS), LiteLLM, Portkey, LLMRouter — all route based on objective o
 
 **Sliding window:** We send the last N messages to the router, not the full conversation. This caps token cost and latency. The window size is configurable. The router doesn't need 50-turn history to detect "the conversation shifted from coding to something else" — the last few turns suffice.
 
+**Server-side windowing:** The window is applied *by OpenCode*, not by slicing a full fetch locally. `list_messages` requests `GET /session/:id/message?limit=N`, and OpenCode's `MessageV2.page` (`packages/opencode/src/session/message-v2.ts`) returns the most recent N messages in chronological order (it orders by `desc(time_created)`, takes the newest N, then `.reverse()`). So OpenCode — the source of truth — does the windowing, and the proxy never fetches more than N messages. This keeps P1 ("OpenCode knows best" / is the source of truth) literally true: there is no client-side history cache, and the router still sees a clean, current window of the user's real conversation (P5). Verified equivalent to the old fetch-all-then-slice path by the `server_side_window_matches_local_slice` unit test.
+
 **Stripping:** Tool calls, tool results, and reasoning parts are stripped from the history we send to the router. They are replaced with concise XML hints:
 
 ```xml
@@ -232,8 +234,8 @@ Source confirmed at:
 - HTTP endpoint: `packages/opencode/src/server/routes/instance/httpapi/groups/tui.ts:140-150`
 
 Two phases per routing event:
-1. **Animated loading toast** — on intercept, oc-route spawns a background task that reposts the toast every ~400ms, cycling the message through `Routing.` → `Routing..` → `Routing...` → back to `Routing.` for as long as routing takes. This works because the TUI's `toast.show()` replaces the current toast in place and resets its auto-dismiss timer on each call (`packages/tui/src/ui/toast.tsx`), so reposting faster than the 5s duration keeps a single toast alive and visibly progressing. The animation stops the instant routing resolves (the guard is dropped).
-2. **Result toast** — once the router returns, oc-route shows the final `"Routed to {model}"` + rationale toast, which replaces the animated one.
+1. **Animated loading toast** — on intercept, oc-route spawns a background task that reposts the toast every ~1000ms, cycling the message through `Routing.` → `Routing..` → `Routing...` → back to `Routing.` for as long as routing takes. This works because the TUI's `toast.show()` replaces the current toast in place and resets its auto-dismiss timer on each call (`packages/tui/src/ui/toast.tsx`), so reposting faster than the 5s duration keeps a single toast alive and visibly progressing. The 1000ms cadence is well under that 5s deadline while cutting background POST volume ~60% versus an earlier 400ms cadence. The animation stops the instant routing resolves: the guard's drop sets an `AtomicBool` flag checked at the *top* of every loop iteration (and notifies to wake the inter-frame sleep), so no stray `Routing...` POST can fire after the drop to clobber the result toast. See `ToastStop` / `ToastAnimatorGuard` in `oc_client.rs`.
+2. **Result toast** — the rationale toast (`"Routed to {model}"` + one-line reason) is shown **after** `forward_to_upstream` returns, not before it. `forward_to_upstream` buffers the full working-model response before returning, so this is the moment the TUI receives the response and the user starts reading it — exactly when the rationale should appear, replacing the now-stopped `Routing...` indicator. It is posted fire-and-forget via `tokio::spawn` (so it doesn't delay the response by the toast POST round-trip) and lasts **8s** via `show_toast_duration` — a sensible read time for a one-line rationale, long enough to read but not lingering indefinitely. Showing it after the forward (rather than before) is what prevents it from being overwritten by stray animator frames or competing with the response-streaming window.
 
 The animation matters because the TUI clears the prompt input synchronously on submit and only renders the user-message bubble once the server starts processing — which, since oc-route routes before forwarding, is after the routing window. So the dots are the user's only feedback that something is happening during that gap. See `spawn_routing_toast` / `ToastAnimatorGuard` in `oc_client.rs`.
 
@@ -420,7 +422,7 @@ Source confirmed at:
 
 OpenCode's `--continue` opens the single most-recently-**updated** session (`app.tsx:494-508`: sorts by `time.updated`, takes the first with no `parentID`). This is fragile in oc-route's presence for two reasons:
 
-1. **Router-session churn.** Every routed message creates a throwaway `"oc-route-router"` session (`prompt_router` in `oc_client.rs`) and deletes it after. While it lives, it is briefly the newest session. A crash or a slow delete can leave it as the newest — and `--continue` would then open an empty router session instead of the user's real conversation.
+1. **Router-session churn.** Every routed message uses a throwaway `"oc-route-router"` session (`run_routing` in `proxy.rs`, via `RouterSessionSlot` in `oc_client.rs`). The slot *mitigates* the churn — it prefetches the next session in the background and releases used ones via async `tokio::spawn` (off the critical path) — but it does not eliminate it: while a session lives it is briefly the newest, and a crash can still leave a stale one as the newest. `--continue` could then open an empty router session instead of the user's real conversation.
 2. **Wrong "newest".** Even in steady state, the most-recently-*updated* session is not necessarily the one the user thinks of as "last conversation" (a one-off test session can outrank a long working session by timestamp).
 
 So oc-route resolves the choice explicitly: it fetches `GET /session`, **drops its own `"oc-route-router"` sessions** (`is_router_session` in `setup.rs`), sorts the remainder by `time.updated` (falling back to `created`), and passes the resulting id via `--session`. The interactive label reflects the resolved target: `Continue last conversation — <title> (ses_…)`. A bare `--continue` is only passed when there are no sessions to resolve at all.
@@ -582,18 +584,29 @@ All confirmed against the actual source at `https://github.com/sst/opencode` (v1
 │      method+path inside the fallback — NOT via an    │
 │      explicit post() route, because that would 405   │
 │      the GET /session/:id/message history fetch)     │
-│        a. POST /tui/show-toast, cycling "Routing./.."  │
-│           every ~400ms until routing resolves (guard)  │
-│        b. Parse body, extract text from parts          │
-│        c. GET /session/:id/message (fetch history)     │
-│        d. Strip tool calls → XML hints                 │
-│        e. Apply sliding window (last N messages)       │
-│        f. Call router model with structured XML input │
-│        g. Receive model choice + rationale             │
-│        h. Inject model field into original body        │
-│        i. Forward modified POST to OpenCode (:4096)    │
-│        j. POST /tui/show-toast (model + rationale)     │
-│        k. Return upstream response to TUI              │
+│        a. POST /tui/show-toast, cycling "Routing./.."    │
+│           every ~1000ms until routing resolves (guard)    │
+│        b. Parse body, extract text from parts             │
+│        c. GET /session/:id/message?limit=N (windowed      │
+│           history fetch — OpenCode returns the newest N;  │
+│           the window is applied server-side, no local     │
+│           slicing of a full fetch)                        │
+│        d. Strip tool calls → XML hints                    │
+│        e. Take a prefetched throwaway router session      │
+│           (RouterSessionSlot::take — created in the       │
+│           background after the previous message; kicks    │
+│           off the next prefetch immediately)              │
+│        f. Call router model with structured XML input     │
+│           (one bounded retry on failure, fresh session    │
+│           per attempt)                                    │
+│        g. Receive model choice + rationale                │
+│        h. Release the used router session off the         │
+│           critical path (async delete via spawn)          │
+│        i. Inject model field into original body           │
+│        j. Forward modified POST to OpenCode (:4096)       │
+│        k. Return upstream response to TUI                 │
+│        l. POST /tui/show-toast (model + rationale, 8s,    │
+│           fire-and-forget AFTER the forward)              │
 │                                                      │
 │  2. Everything else → transparent passthrough        │
 │     (GET /event SSE, GET /session, GET /session/:id, │
@@ -607,7 +620,7 @@ All confirmed against the actual source at `https://github.com/sst/opencode` (v1
 
 ## What is NOT implemented (v1 scope)
 
-- **No caching of routing decisions.** Every message gets a fresh router call.
+- **No caching of routing decisions.** Every message gets a fresh router call. This is a deliberate identity-preserving decision, not an oversight: caching (sticky routing / decision cache) is the single largest remaining latency lever, but it directly negates the "fresh decision per message" principle (P4) that is the program's reason for existing. Two consecutive messages that warrant different models — the exact case oc-route is built to handle — are precisely the case every caching scheme degrades on. Removing the tax means removing the feature.
 - **No custom TUI UI.** We use OpenCode's existing toast notification system only.
 - **No fork of OpenCode.** Pure external proxy.
 - **No JS/TS business logic.** Pure Rust.

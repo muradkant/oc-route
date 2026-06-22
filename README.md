@@ -213,16 +213,20 @@ synchronous and is what the TUI actually uses). It injects a `model` field
 `GET /session/:id/message` (history) and all other endpoints pass through.
 
 The router call is itself a `POST /session/:router_session/message` to OpenCode
-with the router model and an XML-structured routing task; the throwaway session is
-deleted after. History for the router is fetched via
-`GET /session/:id/message`, with tool calls/reasoning stripped to concise XML
-hints and a sliding window applied.
+with the router model and an XML-structured routing task; the throwaway session
+is taken from a prefetched pool (`RouterSessionSlot`) and released off the
+critical path via an async delete. History for the router is fetched via
+`GET /session/:id/message?limit=N` (windowed server-side by OpenCode), with tool
+calls/reasoning stripped to concise XML hints.
 
 Toasts (`POST /tui/show-toast`) flow through OpenCode's SSE event stream and
-render in the TUI. During routing, oc-route reposts the toast every ~400ms,
+render in the TUI. During routing, oc-route reposts the toast every ~1000ms,
 cycling `Routing.` → `Routing..` → `Routing...` → back to `Routing.` — this works
 because OpenCode's `toast.show()` replaces the current toast in place and resets
-its auto-dismiss timer on each call.
+its auto-dismiss timer on each call. The animator stops reliably the instant
+routing resolves (no stray frames can clobber the result), and the rationale
+toast ("Routed to {model}" + reason) is shown after the response forwards,
+lasting 8s.
 
 ## License
 
