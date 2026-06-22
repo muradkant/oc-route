@@ -17,9 +17,8 @@ toast notification shows which model was chosen and why.
 
 RouteLLM, LiteLLM, Portkey, and friends route on objective optimization (cost,
 quality, latency). None support **user fantasies** as routing criteria — "if the
-conversation shifts from coding to creative writing, switch to Claude." oc-route
-is a subjective, user-defined, natural-language LLM router for an interactive
-coding agent.
+conversation gets flirty, switch to Claude." oc-route is a subjective,
+user-defined, natural-language LLM router for an interactive coding agent.
 
 ## How it works
 
