@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct OcClient {
@@ -317,6 +319,98 @@ impl OcClient {
     }
 }
 
+/// A pool of exactly one pre-provisioned throwaway router session.
+///
+/// This is the identity-safe optimization for the per-message router-session churn.
+/// Previously every routed message did, serially on the critical path: create
+/// session -> router call -> delete session. Two of those three round-trips were pure
+/// plumbing with no dependency on the routing itself.
+///
+/// The throwaway-per-message semantics are LOAD-BEARING and must not change: a router
+/// session is never reused, because OpenCode appends every prompt to the session's
+/// history, and reusing one would feed message N's router the accumulated
+/// `<routing_task>` XML from messages 1..N-1 -- violating the "fresh decision per
+/// message" (P4) and "router sees only the user's conversation" (P5) principles.
+///
+/// So this struct keeps the create-once / use-once / delete semantics but moves the
+/// plumbing off the critical path:
+///   - `take()` returns a session that was created in the background *after the
+///     previous message*, so intercept pays ~0ms for creation (just a swap). It then
+///     immediately starts creating the *next* one for the message after.
+///   - `release()` deletes a used session via `tokio::spawn` -- fire-and-forget, off
+///     the critical path entirely.
+pub struct RouterSessionSlot {
+    oc: OcClient,
+    pending: Arc<Mutex<Option<PrefetchedSession>>>,
+}
+
+struct PrefetchedSession {
+    id: String,
+}
+
+impl RouterSessionSlot {
+    pub fn new(oc: OcClient) -> Self {
+        Self {
+            oc,
+            pending: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Start the first prefetch. Call once at startup so the very first intercept
+    /// finds a session waiting (or in flight) instead of paying a cold create.
+    pub fn prime(&self) {
+        self.spawn_prefetch();
+    }
+
+    fn spawn_prefetch(&self) {
+        let oc = self.oc.clone();
+        let pending = self.pending.clone();
+        tokio::spawn(async move {
+            match oc.create_router_session().await {
+                Ok(id) => {
+                    let mut slot = pending.lock().await;
+                    if slot.is_none() {
+                        *slot = Some(PrefetchedSession { id });
+                    } else {
+                        drop(slot);
+                        let _ = oc.delete_session(&id).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("router session prefetch failed: {e}");
+                }
+            }
+        });
+    }
+
+    /// Get a fresh router session for the current message.
+    pub async fn take(&self) -> Result<String> {
+        let fast = {
+            let mut slot = self.pending.lock().await;
+            slot.take().map(|p| p.id)
+        };
+        let id = match fast {
+            Some(id) => id,
+            None => {
+                tracing::info!("router session slot empty; creating synchronously");
+                self.oc.create_router_session().await?
+            }
+        };
+        self.spawn_prefetch();
+        Ok(id)
+    }
+
+    /// Delete a used session in the background. Fire-and-forget.
+    pub fn release(&self, id: String) {
+        let oc = self.oc.clone();
+        tokio::spawn(async move {
+            if let Err(e) = oc.delete_session(&id).await {
+                tracing::warn!("router session delete failed for {id}: {e}");
+            }
+        });
+    }
+}
+
 /// Stops the animated routing toast when dropped. Dropping signals the background
 /// task to exit on its next tick (within the frame interval).
 pub struct ToastAnimatorGuard {
@@ -338,5 +432,47 @@ mod config {
             return None;
         }
         Some((provider.to_string(), model.to_string()))
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windowed_url_is_correct() {
+        fn built_url(limit: Option<usize>) -> String {
+            let base = "http://127.0.0.1:4096";
+            match limit.filter(|&n| n > 0) {
+                Some(n) => format!("{}/session/{}/message?limit={}", base, "ses_x", n),
+                None => format!("{}/session/{}/message", base, "ses_x"),
+            }
+        }
+        assert_eq!(built_url(Some(10)), "http://127.0.0.1:4096/session/ses_x/message?limit=10");
+        assert_eq!(built_url(Some(1)), "http://127.0.0.1:4096/session/ses_x/message?limit=1");
+        assert_eq!(built_url(Some(0)), "http://127.0.0.1:4096/session/ses_x/message");
+        assert_eq!(built_url(None), "http://127.0.0.1:4096/session/ses_x/message");
+    }
+
+    #[tokio::test]
+    async fn slot_take_consumes_and_refills() {
+        let slot = RouterSessionSlot {
+            oc: unreachable_client(),
+            pending: Arc::new(Mutex::new(Some(PrefetchedSession { id: "ses_first".to_string() }))),
+        };
+        let a = { let mut g = slot.pending.lock().await; g.take().map(|p| p.id) };
+        assert_eq!(a.as_deref(), Some("ses_first"));
+        { let mut g = slot.pending.lock().await; *g = Some(PrefetchedSession { id: "ses_second".to_string() }); }
+        let b = { let mut g = slot.pending.lock().await; g.take().map(|p| p.id) };
+        assert_eq!(b.as_deref(), Some("ses_second"));
+        assert_ne!(a, b, "consecutive router sessions must be distinct");
+    }
+
+    fn unreachable_client() -> OcClient {
+        OcClient {
+            base: "http://0.0.0.0:0".to_string(),
+            http: reqwest::Client::builder().build().expect("failed to build reqwest client"),
+        }
     }
 }

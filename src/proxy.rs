@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Profile;
-use crate::oc_client::OcClient;
+use crate::oc_client::{OcClient, RouterSessionSlot};
 use crate::router;
 
 pub type ProxyClient = Client<HttpConnector, Body>;
@@ -28,6 +28,10 @@ pub struct AppState {
     pub oc: OcClient,
     pub profile: Arc<Profile>,
     pub proxy_client: ProxyClient,
+    /// One pre-provisioned throwaway router session, shared across concurrent
+    /// intercepts. `take()` returns a fresh session (and prefetches the next);
+    /// `release()` deletes the used one off the critical path.
+    pub router_slot: Arc<RouterSessionSlot>,
 }
 
 pub fn build_proxy_client() -> ProxyClient {
@@ -286,13 +290,14 @@ async fn run_routing(
         .await?;
     let xml = router::build_routing_xml(&state.profile, &history, new_text);
 
-    let router_session = state.oc.create_router_session().await?;
+    let router_session = state.router_slot.take().await?;
     let timeout = Duration::from_secs(state.profile.router_timeout_secs);
     let router_resp = state
         .oc
         .prompt_router(&router_session, &state.profile.router_model, &xml, timeout)
         .await;
-    let _ = state.oc.delete_session(&router_session).await;
+    // Release the used session off the critical path regardless of outcome.
+    state.router_slot.release(router_session);
 
     let router_resp = router_resp?;
     let decision = router::parse_decision(&router_resp)?;

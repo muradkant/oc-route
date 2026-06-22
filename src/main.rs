@@ -96,7 +96,10 @@ async fn cmd_default() -> Result<()> {
         oc: oc.clone(),
         profile: std::sync::Arc::new(profile),
         proxy_client: build_proxy_client(),
+        router_slot: std::sync::Arc::new(oc_client::RouterSessionSlot::new(oc.clone())),
     };
+    // Prime the first throwaway router session in the background.
+    app_state.router_slot.prime();
     let app = proxy_router(app_state);
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(proxy_listener, app.into_make_service()).await {
@@ -182,10 +185,12 @@ async fn cmd_proxy(args: &[String]) -> Result<()> {
     let oc = OcClient::new_from_url(&upstream);
     let app_state = AppState {
         upstream: upstream.trim_end_matches('/').to_string(),
-        oc,
+        oc: oc.clone(),
         profile: std::sync::Arc::new(profile),
         proxy_client: build_proxy_client(),
+        router_slot: std::sync::Arc::new(oc_client::RouterSessionSlot::new(oc.clone())),
     };
+    app_state.router_slot.prime();
     let app = proxy_router(app_state);
 
     elog(format!(
