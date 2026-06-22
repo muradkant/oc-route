@@ -135,11 +135,15 @@ async fn create_profile_interactive(oc: &OcClient, theme: &ColorfulTheme) -> Res
         return Err(anyhow!("model pool cannot be empty"));
     }
 
-    let router_items: Vec<String> = model_pool
-        .iter()
-        .cloned()
-        .chain(std::iter::once(DEFAULT_ROUTER_MODEL.to_string()))
-        .collect();
+    // Router-model options: the pool plus the default router model, DEDUPLICATED.
+    // Without dedup, if the user already put DEFAULT_ROUTER_MODEL in their pool (which
+    // is natural — they're picking models they want to route among), it appeared twice
+    // in the picker. Dedup keeps first occurrence (pool order wins over the appended
+    // default) so the user sees each model exactly once.
+    let mut router_items: Vec<String> = model_pool.iter().cloned().collect();
+    if !router_items.iter().any(|m| m == DEFAULT_ROUTER_MODEL) {
+        router_items.push(DEFAULT_ROUTER_MODEL.to_string());
+    }
     let router_default = router_items
         .iter()
         .position(|m| m == DEFAULT_ROUTER_MODEL)

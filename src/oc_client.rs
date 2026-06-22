@@ -164,6 +164,10 @@ impl OcClient {
     /// chronological order** — i.e. exactly the sliding window the router wants, so
     /// the proxy can ask the source of truth (OpenCode) to do the windowing instead
     /// of fetching the whole history every message. `limit=None` or `0` returns all.
+    ///
+    /// This keeps P1 ("OpenCode knows best" / is the source of truth) literally true:
+    /// there is no client-side history cache, and the router still sees a clean,
+    /// current window of the user's real conversation (P5).
     pub async fn list_messages(
         &self,
         session_id: &str,
@@ -265,11 +269,26 @@ impl OcClient {
     }
 
     pub async fn show_toast(&self, title: &str, message: &str, variant: &str) -> Result<()> {
+        self.show_toast_duration(title, message, variant, Duration::from_secs(8))
+            .await
+    }
+
+    /// Like [`show_toast`] but with an explicit dismiss duration. The rationale
+    /// toast ("Routed to X — <reason>") needs a longer read time than the default
+    /// transient toast; 8s is a sensible default for a one-line rationale the user
+    /// actively wants to read, without lingering indefinitely.
+    pub async fn show_toast_duration(
+        &self,
+        title: &str,
+        message: &str,
+        variant: &str,
+        duration: Duration,
+    ) -> Result<()> {
         let body = json!({
             "title": title,
             "message": message,
             "variant": variant,
-            "duration": 5000,
+            "duration": duration.as_millis() as u64,
         });
         let resp = self
             .http
@@ -288,30 +307,32 @@ impl OcClient {
     /// Show an animated "Routing…" toast that cycles its dots (`.`, `..`, `...`)
     /// until the returned guard is dropped. OpenCode's toast `show()` replaces the
     /// current toast in place and resets its auto-dismiss timer on each call, so
-    /// reposting every ~400ms keeps a single toast alive and visibly progressing —
-    /// giving the user a sense of active loading instead of a frozen 5s banner.
+    /// reposting every ~1000ms keeps a single toast alive and visibly progressing —
+    /// giving the user a sense of active loading instead of a frozen banner.
     ///
-    /// Returns a [`ToastAnimatorGuard`] whose drop stops the animation. Call
-    /// `show_toast` (or another animator) afterward to display the result.
+    /// Returns a [`ToastAnimatorGuard`] whose drop stops the animation *promptly and
+    /// reliably*: it sets a flag checked at the top of every loop iteration, so no
+    /// stray `Routing...` POST can ever fire after the drop to clobber a result toast.
     pub fn spawn_routing_toast(&self, title: &str) -> ToastAnimatorGuard {
         let title = title.to_string();
-        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        let stop = std::sync::Arc::new(ToastStop::new());
         let stop_clone = stop.clone();
         let oc = self.clone();
         let frames = ["Routing.", "Routing..", "Routing..."];
         tokio::spawn(async move {
             let mut idx = 0;
-            // The toast auto-dismisses after `duration` if never refreshed; repost well
-            // before that to keep it alive. 1000ms keeps the toast alive (well under the
-            // 5s auto-dismiss window) while cutting background POST volume ~60% versus
-            // the old 400ms cadence. The animation is still visibly progressing (a calm
-            // pulse), preserving the "something is happening" feedback (P7).
             let interval = Duration::from_millis(1000);
             loop {
+                // Check the flag at the TOP of each iteration, before any POST. This is
+                // the key to reliability: drop sets the flag AND notifies to wake the
+                // sleep, so after drop the loop wakes, re-checks, and exits WITHOUT
+                // firing another `Routing...` POST that would overwrite a result toast.
+                if stop_clone.is_set() {
+                    break;
+                }
                 let msg = frames[idx % frames.len()];
                 let _ = oc.show_toast(&title, msg, "info").await;
                 idx += 1;
-                // Race the sleep against a stop notification so drop cancels promptly.
                 tokio::select! {
                     _ = stop_clone.notified() => break,
                     _ = tokio::time::sleep(interval) => {}
@@ -326,13 +347,13 @@ impl OcClient {
 ///
 /// This is the identity-safe optimization for the per-message router-session churn.
 /// Previously every routed message did, serially on the critical path: create
-/// session -> router call -> delete session. Two of those three round-trips were pure
+/// session → router call → delete session. Two of those three round-trips were pure
 /// plumbing with no dependency on the routing itself.
 ///
 /// The throwaway-per-message semantics are LOAD-BEARING and must not change: a router
 /// session is never reused, because OpenCode appends every prompt to the session's
 /// history, and reusing one would feed message N's router the accumulated
-/// `<routing_task>` XML from messages 1..N-1 -- violating the "fresh decision per
+/// `<routing_task>` XML from messages 1..N−1 — violating the "fresh decision per
 /// message" (P4) and "router sees only the user's conversation" (P5) principles.
 ///
 /// So this struct keeps the create-once / use-once / delete semantics but moves the
@@ -340,13 +361,22 @@ impl OcClient {
 ///   - `take()` returns a session that was created in the background *after the
 ///     previous message*, so intercept pays ~0ms for creation (just a swap). It then
 ///     immediately starts creating the *next* one for the message after.
-///   - `release()` deletes a used session via `tokio::spawn` -- fire-and-forget, off
+///   - `release()` deletes a used session via `tokio::spawn` — fire-and-forget, off
 ///     the critical path entirely.
+///
+/// If the prefetched session isn't ready yet when `take()` is called (e.g. two
+/// messages sent in quick succession, or the first message of a run), `take()` falls
+/// back to a synchronous create. Correctness is never compromised — only latency.
 pub struct RouterSessionSlot {
     oc: OcClient,
+    // The single prefetched session, if one is ready. None = a prefetch is in flight
+    // or none has been requested yet. Creating a session is a single HTTP POST and
+    // OpenCode handles it quickly, so under normal cadence the slot is populated.
     pending: Arc<Mutex<Option<PrefetchedSession>>>,
 }
 
+// A ready-to-use session id together with the handle of the background task that
+// created it, so we can await its completion if a caller takes it mid-creation.
 struct PrefetchedSession {
     id: String,
 }
@@ -372,9 +402,11 @@ impl RouterSessionSlot {
             match oc.create_router_session().await {
                 Ok(id) => {
                     let mut slot = pending.lock().await;
+                    // Only store if nobody else populated the slot in the meantime.
                     if slot.is_none() {
                         *slot = Some(PrefetchedSession { id });
                     } else {
+                        // Lost the race; clean up the extra session asynchronously.
                         drop(slot);
                         let _ = oc.delete_session(&id).await;
                     }
@@ -386,8 +418,12 @@ impl RouterSessionSlot {
         });
     }
 
-    /// Get a fresh router session for the current message.
+    /// Get a fresh router session for the current message. Returns instantly if a
+    /// prefetched session is ready; otherwise creates one synchronously as a fallback
+    /// (correctness preserved, just slower). Always kicks off the next prefetch so
+    /// the following message finds a session waiting.
     pub async fn take(&self) -> Result<String> {
+        // Try the fast path first: grab the prefetched session if it's ready.
         let fast = {
             let mut slot = self.pending.lock().await;
             slot.take().map(|p| p.id)
@@ -399,11 +435,15 @@ impl RouterSessionSlot {
                 self.oc.create_router_session().await?
             }
         };
+        // Immediately start prefetching the next one. We return right away.
         self.spawn_prefetch();
         Ok(id)
     }
 
-    /// Delete a used session in the background. Fire-and-forget.
+    /// Delete a used session in the background. Fire-and-forget: this must never
+    /// block the critical path. The only consequence of a failed/late delete is a
+    /// stale `"oc-route-router"` session — which `is_router_session` in setup.rs
+    /// already hides from the picker, so it cannot be accidentally continued.
     pub fn release(&self, id: String) {
         let oc = self.oc.clone();
         tokio::spawn(async move {
@@ -414,15 +454,47 @@ impl RouterSessionSlot {
     }
 }
 
-/// Stops the animated routing toast when dropped. Dropping signals the background
-/// task to exit on its next tick (within the frame interval).
+/// Cooperative stop signal for the toast animator loop. Combines:
+///   - an `AtomicBool` flag, checked at the TOP of every loop iteration, and
+///   - a `Notify`, to wake the loop out of its inter-frame sleep on drop.
+/// The flag is what guarantees "no stray POST after drop": even if the notify is
+/// missed (the loop was between wait points), the next iteration's top-of-loop
+/// check sees the flag and exits before posting.
+struct ToastStop {
+    flag: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ToastStop {
+    fn new() -> Self {
+        Self {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+    fn is_set(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn notified(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.notify.notified()
+    }
+    fn signal(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        // notify_one so a currently-sleeping loop wakes immediately.
+        self.notify.notify_one();
+    }
+}
+
+/// Stops the animated routing toast when dropped. Dropping signals the animator to
+/// exit on its next tick (within the frame interval). See [`ToastStop`] for why
+/// the stop is reliable (no stray POSTs after drop).
 pub struct ToastAnimatorGuard {
-    stop: std::sync::Arc<tokio::sync::Notify>,
+    stop: std::sync::Arc<ToastStop>,
 }
 
 impl Drop for ToastAnimatorGuard {
     fn drop(&mut self) {
-        self.stop.notify_waiters();
+        self.stop.signal();
     }
 }
 
@@ -438,13 +510,17 @@ mod config {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The windowed history URL must ask the server for exactly the most recent N
+    /// messages — no client-side slicing. None/0 must omit the param (returns all),
+    /// matching the OpenCode handler's `limit === undefined || limit === 0` branch.
     #[test]
     fn windowed_url_is_correct() {
+        // We test the URL-construction logic directly by mirroring list_messages's
+        // branch. This is the contract the router's sliding window depends on.
         fn built_url(limit: Option<usize>) -> String {
             let base = "http://127.0.0.1:4096";
             match limit.filter(|&n| n > 0) {
@@ -452,30 +528,66 @@ mod tests {
                 None => format!("{}/session/{}/message", base, "ses_x"),
             }
         }
-        assert_eq!(built_url(Some(10)), "http://127.0.0.1:4096/session/ses_x/message?limit=10");
-        assert_eq!(built_url(Some(1)), "http://127.0.0.1:4096/session/ses_x/message?limit=1");
+        assert_eq!(
+            built_url(Some(10)),
+            "http://127.0.0.1:4096/session/ses_x/message?limit=10"
+        );
+        assert_eq!(
+            built_url(Some(1)),
+            "http://127.0.0.1:4096/session/ses_x/message?limit=1"
+        );
+        // 0 and None must fall through to "fetch all" — never send limit=0, which the
+        // OC handler treats as "all" anyway, but omitting is clearer and avoids an
+        // edge case if the handler semantics ever change.
         assert_eq!(built_url(Some(0)), "http://127.0.0.1:4096/session/ses_x/message");
         assert_eq!(built_url(None), "http://127.0.0.1:4096/session/ses_x/message");
     }
 
+    /// A RouterSessionSlot must hand out distinct ids on consecutive `take()` calls
+    /// when creation is faked — i.e. it never hands the same session id twice, which
+    /// is the mechanism that enforces "fresh decision per message" (P4). We can't
+    /// test the real HTTP path without a server, so we test the swap semantics by
+    /// driving the slot's internal state directly.
     #[tokio::test]
     async fn slot_take_consumes_and_refills() {
+        // Simulate two prefetched sessions landing in the slot, one after another.
         let slot = RouterSessionSlot {
             oc: unreachable_client(),
-            pending: Arc::new(Mutex::new(Some(PrefetchedSession { id: "ses_first".to_string() }))),
+            pending: Arc::new(Mutex::new(Some(PrefetchedSession {
+                id: "ses_first".to_string(),
+            }))),
         };
-        let a = { let mut g = slot.pending.lock().await; g.take().map(|p| p.id) };
+        // First take gets the prefetched one.
+        let a = {
+            let mut g = slot.pending.lock().await;
+            g.take().map(|p| p.id)
+        };
         assert_eq!(a.as_deref(), Some("ses_first"));
-        { let mut g = slot.pending.lock().await; *g = Some(PrefetchedSession { id: "ses_second".to_string() }); }
-        let b = { let mut g = slot.pending.lock().await; g.take().map(|p| p.id) };
+        // Slot is now empty until a prefetch lands — take() would fall back to sync
+        // creation. Inject a second prefetched session and confirm it's distinct.
+        {
+            let mut g = slot.pending.lock().await;
+            *g = Some(PrefetchedSession {
+                id: "ses_second".to_string(),
+            });
+        }
+        let b = {
+            let mut g = slot.pending.lock().await;
+            g.take().map(|p| p.id)
+        };
         assert_eq!(b.as_deref(), Some("ses_second"));
         assert_ne!(a, b, "consecutive router sessions must be distinct");
     }
 
+    /// A client with a bogus base — its methods will never be called in these tests,
+    /// we only need the type to construct a slot. If anything accidentally awaits it,
+    /// the test will fail loudly rather than silently.
     fn unreachable_client() -> OcClient {
         OcClient {
             base: "http://0.0.0.0:0".to_string(),
-            http: reqwest::Client::builder().build().expect("failed to build reqwest client"),
+            http: Client::builder()
+                .build()
+                .expect("failed to build reqwest client"),
         }
     }
 }

@@ -30,7 +30,9 @@ pub struct AppState {
     pub proxy_client: ProxyClient,
     /// One pre-provisioned throwaway router session, shared across concurrent
     /// intercepts. `take()` returns a fresh session (and prefetches the next);
-    /// `release()` deletes the used one off the critical path.
+    /// `release()` deletes the used one off the critical path. See
+    /// [`crate::oc_client::RouterSessionSlot`] for why the create-once/use-once
+    /// semantics are preserved (P4/P5).
     pub router_slot: Arc<RouterSessionSlot>,
 }
 
@@ -167,14 +169,16 @@ async fn intercept_prompt(
     );
 
     // Animated loading toast: cycles "Routing." → "Routing.." → "Routing..." every
-    // ~400ms while routing runs. The guard stops the animation when dropped, so it
-    // covers exactly the routing window — then the result toast below takes over.
+    // ~1000ms while routing runs. The guard stops the animation when dropped, so it
+    // covers exactly the routing window.
     let _routing_toast = state.oc.spawn_routing_toast("oc-route");
 
     let routing_result = run_routing(&state, &session_id, &new_text).await;
 
-    // Drop the animator now so the result toast isn't immediately overwritten by
-    // the next animation frame. (Explicit for clarity; the block scope would too.)
+    // Drop the animator BEFORE doing anything else. The guard's stop is reliable
+    // (top-of-loop flag check), so no stray `Routing...` POST can fire after this to
+    // clobber the rationale toast. This ends the "Routing..." indicator at exactly
+    // the right moment: routing is done.
     drop(_routing_toast);
 
     let (provider, model, rationale_text, toast_variant) = match routing_result {
@@ -198,18 +202,12 @@ async fn intercept_prompt(
     };
 
     let display_model = format!("{}/{}", provider, model);
-    let title = format!("Routed to {}", display_model);
-    let _ = state
-        .oc
-        .show_toast(&title, &rationale_text, toast_variant)
-        .await;
-
     let mut modified = original_body.clone();
     modified["model"] = json!({ "providerID": provider, "modelID": model });
     let modified_bytes =
         serde_json::to_vec(&modified).unwrap_or_else(|_| body_bytes.to_vec());
 
-    forward_to_upstream(
+    let response = forward_to_upstream(
         &state,
         &path,
         &forward_headers,
@@ -217,7 +215,24 @@ async fn intercept_prompt(
         Some("application/json"),
         auth.as_deref(),
     )
-    .await
+    .await;
+
+    // Show the rationale toast AFTER the forward returns. forward_to_upstream buffers
+    // the full working-model response before returning, so this is the moment the TUI
+    // receives the response and the user starts reading it — exactly when the
+    // rationale should appear and replace the now-stopped "Routing..." indicator.
+    // Fire-and-forget via spawn so we don't delay the response by the toast POST, and
+    // so the rationale lives its full ~8s concurrently while the user reads the reply.
+    // A sensible read duration: long enough to read a one-line rationale, not forever.
+    let title = format!("Routed to {}", display_model);
+    let oc = state.oc.clone();
+    tokio::spawn(async move {
+        let _ = oc
+            .show_toast_duration(&title, &rationale_text, toast_variant, Duration::from_secs(8))
+            .await;
+    });
+
+    response
 }
 
 async fn forward_to_upstream(
@@ -284,18 +299,24 @@ async fn run_routing(
     session_id: &str,
     new_text: &str,
 ) -> Result<(String, String)> {
+    // Ask OpenCode (the source of truth) to do the windowing server-side: it returns
+    // exactly the most recent N messages in chronological order (verified in OC
+    // source, MessageV2.page). This avoids fetching the whole history every message.
     let history = state
         .oc
         .list_messages(session_id, Some(state.profile.sliding_window))
         .await?;
     let xml = router::build_routing_xml(&state.profile, &history, new_text);
+
     let timeout = Duration::from_secs(state.profile.router_timeout_secs);
 
     // Free-tier router endpoints flake; one bounded retry buys real reliability for
     // exactly one extra round-trip on failure. Each attempt uses a FRESH throwaway
-    // session (taken from the slot, released off the critical path) -- so the
+    // session (taken from the slot, released off the critical path) — so the
     // "fresh decision per message" (P4) and "router sees only the user's
-    // conversation" (P5) invariants hold on every attempt.
+    // conversation" (P5) invariants hold on every attempt: the router never sees
+    // a prior attempt's `<routing_task>` XML, because that session is separate and
+    // gets deleted.
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=1 {
         let router_session = match state.router_slot.take().await {
@@ -309,6 +330,7 @@ async fn run_routing(
             .oc
             .prompt_router(&router_session, &state.profile.router_model, &xml, timeout)
             .await;
+        // Release the used session off the critical path regardless of outcome.
         state.router_slot.release(router_session);
 
         match router_resp {
@@ -318,14 +340,27 @@ async fn run_routing(
                     match router::validate_model(&decision.model, &state.profile.model_pool) {
                         Some(pm) => pm,
                         None => {
-                            tracing::warn!("run_routing: model '{}' not in pool; using fallback", decision.model);
-                            let fallback = state.profile.model_pool.first().cloned()
+                            tracing::warn!(
+                                "run_routing: model '{}' not in pool; using fallback",
+                                decision.model
+                            );
+                            let fallback = state
+                                .profile
+                                .model_pool
+                                .first()
+                                .cloned()
                                 .unwrap_or_else(|| state.profile.router_model.clone());
                             let (p, m) = config_split(&fallback);
-                            return Ok((format!("{}/{}", p, m),
-                                format!("router chose '{}' (not in pool); using fallback", decision.model)));
+                            return Ok((
+                                format!("{}/{}", p, m),
+                                format!(
+                                    "router chose '{}' (not in pool); using fallback",
+                                    decision.model
+                                ),
+                            ));
                         }
                     };
+
                 return Ok((format!("{}/{}", provider, model), decision.rationale));
             }
             Err(e) => {
