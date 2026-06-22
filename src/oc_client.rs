@@ -154,12 +154,24 @@ impl OcClient {
         Ok(sessions)
     }
 
-    pub async fn list_messages(&self, session_id: &str) -> Result<Vec<Value>> {
-        let resp = self
-            .http
-            .get(format!("{}/session/{}/message", self.base, session_id))
-            .send()
-            .await?;
+    /// Fetch the messages for a session, optionally capped to the most recent `limit`.
+    ///
+    /// The `?limit=N` query is honored server-side by `MessageV2.page` (verified in
+    /// OpenCode source: `session/message-v2.ts` — `orderBy(desc(time_created))`, take
+    /// newest N, then `.reverse()`). It returns the **most recent N messages in
+    /// chronological order** — i.e. exactly the sliding window the router wants, so
+    /// the proxy can ask the source of truth (OpenCode) to do the windowing instead
+    /// of fetching the whole history every message. `limit=None` or `0` returns all.
+    pub async fn list_messages(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let url = match limit.filter(|&n| n > 0) {
+            Some(n) => format!("{}/session/{}/message?limit={}", self.base, session_id, n),
+            None => format!("{}/session/{}/message", self.base, session_id),
+        };
+        let resp = self.http.get(url).send().await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {

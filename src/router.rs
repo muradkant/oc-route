@@ -307,4 +307,47 @@ mod tests {
         let pool = vec!["anthropic/claude".to_string()];
         assert!(validate_model("google/gemini", &pool).is_none());
     }
+
+    /// CRITICAL equivalence: the new path (server returns the most recent N messages
+    /// via `?limit=N`, then apply_sliding_window is a no-op since len <= window) must
+    /// produce the *same* router XML as the old path (fetch ALL, then slice last N).
+    #[test]
+    fn server_side_window_matches_local_slice() {
+        let window = 3;
+        let full: Vec<Value> = (1..=3)
+            .flat_map(|i| {
+                [
+                    serde_json::json!({
+                        "info": { "role": "user" },
+                        "parts": [{ "type": "text", "text": format!("u{i}") }]
+                    }),
+                    serde_json::json!({
+                        "info": { "role": "assistant", "model": format!("m{i}") },
+                        "parts": [{ "type": "text", "text": format!("a{i}") }]
+                    }),
+                ]
+            })
+            .collect();
+        assert_eq!(full.len(), 6);
+
+        let old_windowed = apply_sliding_window(&full, window);
+        let new_from_server: Vec<Value> = full[full.len() - window..].to_vec();
+        let new_windowed = apply_sliding_window(&new_from_server, window);
+
+        let profile = Profile {
+            name: "t".into(),
+            router_model: "opencode/mimo-v2.5-free".into(),
+            sliding_window: window,
+            router_timeout_secs: 90,
+            model_pool: vec!["opencode/mimo-v2.5-free".into()],
+            routing_prompt: "rules".into(),
+        };
+        let old_xml = build_routing_xml(&profile, &old_windowed, "new");
+        let new_xml = build_routing_xml(&profile, &new_windowed, "new");
+        assert_eq!(old_xml, new_xml,
+            "server-side windowing must produce identical router input");
+        assert_eq!(old_windowed.len(), window);
+        assert!(old_xml.contains("a3"), "newest message must be in window");
+        assert!(!old_xml.contains("u1"), "oldest message must be outside the window");
+    }
 }

@@ -280,7 +280,10 @@ async fn run_routing(
     session_id: &str,
     new_text: &str,
 ) -> Result<(String, String)> {
-    let history = state.oc.list_messages(session_id).await?;
+    let history = state
+        .oc
+        .list_messages(session_id, Some(state.profile.sliding_window))
+        .await?;
     let xml = router::build_routing_xml(&state.profile, &history, new_text);
 
     let router_session = state.oc.create_router_session().await?;
