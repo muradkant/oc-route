@@ -117,6 +117,15 @@ async fn cmd_default() -> Result<()> {
                 Err(e) => format!("opencode attach failed: {e}"),
             }
         }
+        status = serve_child.wait() => {
+            // The real OpenCode server died out from under us. Without this branch the
+            // proxy would keep running and every request would fail with an opaque 502
+            // while the TUI sits there. Surface it as a real exit reason and tear down.
+            match status {
+                Ok(s) => format!("opencode serve exited unexpectedly ({})", s),
+                Err(e) => format!("opencode serve failed: {e}"),
+            }
+        }
         _ = tokio::signal::ctrl_c() => {
             "interrupted".to_string()
         }

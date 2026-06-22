@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -289,43 +289,52 @@ async fn run_routing(
         .list_messages(session_id, Some(state.profile.sliding_window))
         .await?;
     let xml = router::build_routing_xml(&state.profile, &history, new_text);
-
-    let router_session = state.router_slot.take().await?;
     let timeout = Duration::from_secs(state.profile.router_timeout_secs);
-    let router_resp = state
-        .oc
-        .prompt_router(&router_session, &state.profile.router_model, &xml, timeout)
-        .await;
-    // Release the used session off the critical path regardless of outcome.
-    state.router_slot.release(router_session);
 
-    let router_resp = router_resp?;
-    let decision = router::parse_decision(&router_resp)?;
-    let (provider, model) = match router::validate_model(&decision.model, &state.profile.model_pool) {
-        Some(pm) => pm,
-        None => {
-            tracing::warn!(
-                "run_routing: model '{}' not in pool; using fallback",
-                decision.model
-            );
-            let fallback = state
-                .profile
-                .model_pool
-                .first()
-                .cloned()
-                .unwrap_or_else(|| state.profile.router_model.clone());
-            let (p, m) = config_split(&fallback);
-            return Ok((
-                format!("{}/{}", p, m),
-                format!(
-                    "router chose '{}' (not in pool); using fallback",
-                    decision.model
-                ),
-            ));
+    // Free-tier router endpoints flake; one bounded retry buys real reliability for
+    // exactly one extra round-trip on failure. Each attempt uses a FRESH throwaway
+    // session (taken from the slot, released off the critical path) -- so the
+    // "fresh decision per message" (P4) and "router sees only the user's
+    // conversation" (P5) invariants hold on every attempt.
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..=1 {
+        let router_session = match state.router_slot.take().await {
+            Ok(id) => id,
+            Err(e) => {
+                last_err = Some(e.context("take router session"));
+                continue;
+            }
+        };
+        let router_resp = state
+            .oc
+            .prompt_router(&router_session, &state.profile.router_model, &xml, timeout)
+            .await;
+        state.router_slot.release(router_session);
+
+        match router_resp {
+            Ok(text) => {
+                let decision = router::parse_decision(&text)?;
+                let (provider, model) =
+                    match router::validate_model(&decision.model, &state.profile.model_pool) {
+                        Some(pm) => pm,
+                        None => {
+                            tracing::warn!("run_routing: model '{}' not in pool; using fallback", decision.model);
+                            let fallback = state.profile.model_pool.first().cloned()
+                                .unwrap_or_else(|| state.profile.router_model.clone());
+                            let (p, m) = config_split(&fallback);
+                            return Ok((format!("{}/{}", p, m),
+                                format!("router chose '{}' (not in pool); using fallback", decision.model)));
+                        }
+                    };
+                return Ok((format!("{}/{}", provider, model), decision.rationale));
+            }
+            Err(e) => {
+                tracing::warn!("run_routing: attempt {} failed: {e}", attempt + 1);
+                last_err = Some(e);
+            }
         }
-    };
-
-    Ok((format!("{}/{}", provider, model), decision.rationale))
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("routing failed with no error captured")))
 }
 
 fn parse_prompt_path(path: &str) -> Option<(String, &'static str)> {
