@@ -98,7 +98,8 @@ async fn cmd_default() -> Result<()> {
         proxy_client: build_proxy_client(),
         router_slot: std::sync::Arc::new(oc_client::RouterSessionSlot::new(oc.clone())),
     };
-    // Prime the first throwaway router session in the background.
+    // Prime the first throwaway router session in the background so the very first
+    // intercept finds one waiting (or in flight) instead of paying a cold create.
     app_state.router_slot.prime();
     let app = proxy_router(app_state);
     let proxy_handle = tokio::spawn(async move {

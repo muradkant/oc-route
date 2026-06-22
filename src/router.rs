@@ -311,9 +311,15 @@ mod tests {
     /// CRITICAL equivalence: the new path (server returns the most recent N messages
     /// via `?limit=N`, then apply_sliding_window is a no-op since len <= window) must
     /// produce the *same* router XML as the old path (fetch ALL, then slice last N).
+    ///
+    /// This is what makes fix #4 identity-safe: the router sees byte-identical input
+    /// either way, so routing decisions (P3/P4) and the clean-context window (P5) are
+    /// unchanged. We prove it by constructing a full history, taking the last N both
+    /// ways, and asserting the rendered conversation matches.
     #[test]
     fn server_side_window_matches_local_slice() {
         let window = 3;
+        // A 6-message history: u1,a1,u2,a2,u3,a3 (oldest -> newest).
         let full: Vec<Value> = (1..=3)
             .flat_map(|i| {
                 [
@@ -330,10 +336,15 @@ mod tests {
             .collect();
         assert_eq!(full.len(), 6);
 
+        // OLD path: fetch all, then slice last `window` locally.
         let old_windowed = apply_sliding_window(&full, window);
+        // NEW path: server returned the most recent `window` directly (chronological).
+        // That is exactly full[len-window..], i.e. the same slice.
         let new_from_server: Vec<Value> = full[full.len() - window..].to_vec();
-        let new_windowed = apply_sliding_window(&new_from_server, window);
+        let new_windowed = apply_sliding_window(&new_from_server, window); // no-op now
 
+        // Both must render to the same conversation XML — i.e. the router sees the
+        // same thing whether we sliced client-side or asked the server to slice.
         let profile = Profile {
             name: "t".into(),
             router_model: "opencode/mimo-v2.5-free".into(),
@@ -344,10 +355,19 @@ mod tests {
         };
         let old_xml = build_routing_xml(&profile, &old_windowed, "new");
         let new_xml = build_routing_xml(&profile, &new_windowed, "new");
-        assert_eq!(old_xml, new_xml,
-            "server-side windowing must produce identical router input");
+        assert_eq!(
+            old_xml, new_xml,
+            "server-side windowing must produce identical router input"
+        );
+
+        // And sanity: the window actually trimmed. window=3 on a 6-message history
+        // [u1,a1,u2,a2,u3,a3] keeps the last 3: [a2,u3,a3]. So u1 (oldest) is gone,
+        // a3 (newest) is present, and the count matches the window.
         assert_eq!(old_windowed.len(), window);
         assert!(old_xml.contains("a3"), "newest message must be in window");
-        assert!(!old_xml.contains("u1"), "oldest message must be outside the window");
+        assert!(
+            !old_xml.contains("u1"),
+            "oldest message must be outside the window"
+        );
     }
 }
