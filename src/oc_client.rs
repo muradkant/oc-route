@@ -302,8 +302,11 @@ impl OcClient {
         tokio::spawn(async move {
             let mut idx = 0;
             // The toast auto-dismisses after `duration` if never refreshed; repost well
-            // before that to keep it alive. ~400ms gives a calm, readable animation.
-            let interval = Duration::from_millis(400);
+            // before that to keep it alive. 1000ms keeps the toast alive (well under the
+            // 5s auto-dismiss window) while cutting background POST volume ~60% versus
+            // the old 400ms cadence. The animation is still visibly progressing (a calm
+            // pulse), preserving the "something is happening" feedback (P7).
+            let interval = Duration::from_millis(1000);
             loop {
                 let msg = frames[idx % frames.len()];
                 let _ = oc.show_toast(&title, msg, "info").await;
