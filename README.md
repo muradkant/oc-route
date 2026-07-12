@@ -22,8 +22,8 @@ Requirements:
 - stable Rust.
 
 ```sh
-git clone https://github.com/muradkant/opencode-llm-alternation.git
-cd opencode-llm-alternation
+git clone https://github.com/muradkant/oc-route.git
+cd oc-route
 cargo build --release
 install -Dm755 target/release/oc-route "$HOME/.local/bin/oc-route"
 ```
