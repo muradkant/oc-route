@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use setup::SessionChoice;
 use std::io::Write;
 use std::net::TcpListener;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::net::TcpListener as TokioTcpListener;
@@ -18,6 +19,7 @@ use proxy::{build_proxy_client, router as proxy_router, AppState};
 
 const SERVE_PREF_PORT: u16 = 4096;
 const PROXY_PREF_PORT: u16 = 4097;
+const ROUTER_STORAGE_PREFIX: &str = "oc-route-router-";
 
 #[derive(Clone, Copy)]
 enum ServerPurpose {
@@ -474,13 +476,22 @@ fn spawn_opencode_serve(
         "OPENCODE_CONFIG_CONTENT",
         opencode_config_with_router_agent()?,
     );
+    terminate_child_if_parent_dies(&mut command);
     let storage = if matches!(purpose, ServerPurpose::RouterSidecar) {
         // Keep internal routing sessions completely separate from the upstream
         // OpenCode database while avoiding the large RSS cost of SQLite :memory:.
+        if let Err(error) = cleanup_stale_router_storage(&std::env::temp_dir()) {
+            tracing::warn!("could not clean stale private router storage: {error}");
+        }
         let storage = tempfile::Builder::new()
-            .prefix("oc-route-router-")
+            .prefix(ROUTER_STORAGE_PREFIX)
             .tempdir()
             .context("failed to create private router database directory")?;
+        std::fs::write(
+            storage.path().join("owner.pid"),
+            std::process::id().to_string(),
+        )
+        .context("failed to record private router database ownership")?;
         command.env("OPENCODE_DB", storage.path().join("opencode.db"));
         Some(storage)
     } else {
@@ -534,6 +545,7 @@ fn spawn_opencode_attach(proxy_port: u16, choice: &SessionChoice) -> Result<Chil
     let url = format!("http://127.0.0.1:{}", proxy_port);
     let mut cmd = Command::new("opencode");
     cmd.arg("attach").arg(&url);
+    terminate_child_if_parent_dies(&mut cmd);
     match choice {
         SessionChoice::Continue => {
             cmd.arg("--continue");
@@ -550,6 +562,55 @@ fn spawn_opencode_attach(proxy_port: u16, choice: &SessionChoice) -> Result<Chil
         .spawn()
         .context("failed to spawn `opencode attach`")?;
     Ok(child)
+}
+
+/// Linux does not automatically terminate a child when its parent is killed.
+/// Register SIGTERM before exec so an abruptly terminated oc-route cannot strand
+/// an OpenCode server or attach process. The parent check closes the fork/exec race
+/// where oc-route dies immediately before the child installs the signal.
+fn terminate_child_if_parent_dies(command: &mut Command) {
+    // SAFETY: pre_exec restricts the closure to async-signal-safe operations. prctl,
+    // getppid, and raise are direct libc syscalls and the closure captures nothing.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                libc::raise(libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+}
+
+fn cleanup_stale_router_storage(temp_root: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(temp_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("failed to inspect temporary directory"),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(ROUTER_STORAGE_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        let owner = match std::fs::read_to_string(path.join("owner.pid"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        {
+            Some(owner) => owner,
+            None => continue,
+        };
+        if Path::new("/proc").join(owner.to_string()).exists() {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::warn!("failed to remove stale {}: {error}", path.display());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -584,5 +645,26 @@ mod tests {
         );
         assert!(merge_router_agent_config(Some("[]")).is_err());
         assert!(merge_router_agent_config(Some(r#"{"agent":[]}"#)).is_err());
+    }
+
+    #[test]
+    fn stale_router_storage_is_removed_without_touching_live_or_unowned_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let stale = root.path().join(format!("{ROUTER_STORAGE_PREFIX}stale"));
+        let live = root.path().join(format!("{ROUTER_STORAGE_PREFIX}live"));
+        let unowned = root.path().join(format!("{ROUTER_STORAGE_PREFIX}unowned"));
+        let unrelated = root.path().join("something-else");
+        for path in [&stale, &live, &unowned, &unrelated] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(stale.join("owner.pid"), u32::MAX.to_string()).unwrap();
+        std::fs::write(live.join("owner.pid"), std::process::id().to_string()).unwrap();
+
+        cleanup_stale_router_storage(root.path()).unwrap();
+
+        assert!(!stale.exists());
+        assert!(live.exists());
+        assert!(unowned.exists());
+        assert!(unrelated.exists());
     }
 }

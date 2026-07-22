@@ -103,8 +103,9 @@ prose because real models do not all honor native JSON modes consistently. It th
 requires deserializable string fields and validates the normalized model ID against
 the exact pool. The rationale is collapsed to one bounded line.
 
-Transport errors, malformed output, and out-of-pool choices each consume one of two
-fresh attempts. Each attempt:
+Retryable transport errors, malformed output, and out-of-pool choices may consume
+a second fresh attempt, but both attempts share one total profile deadline. Errors
+OpenCode identifies as non-retryable fail open immediately. Each attempt:
 
 1. creates and registers a short-lived internal session;
 2. sends the router model the dedicated-agent request;
@@ -115,6 +116,10 @@ Deletion is off the critical path. Active IDs remain tracked until OpenCode conf
 deletion; shutdown drains the set again. In sidecar mode an absolute `OPENCODE_DB`
 path in an owned temporary directory keeps those sessions out of the upstream
 database entirely without SQLite's higher in-memory RSS.
+
+Router prompts request OpenCode's `none` model variant. Models that expose it skip
+optional reasoning; models without it ignore the unmatched variant. The decision
+still passes through the same parser and exact-pool validation.
 
 If both attempts fail, the proxy forwards the original bytes. This is a deliberate
 fail-open for model selection, not a fabricated success: the upstream still decides
@@ -150,7 +155,9 @@ Standalone mode does not own the supplied upstream. If it starts a private route
 sidecar, that child inherits local OpenCode provider/auth configuration but uses an
 isolated temporary session database. Sidecar death is monitored; proxy shutdown
 kills it; dropping its owner removes the database; upstream health and configuration
-are not mutated.
+are not mutated. Linux parent-death signals also terminate children after an abrupt
+parent death; the next launch removes any PID-marked temporary database whose owner
+could not run normal cleanup.
 
 Directory context and Basic authentication apply consistently to internal history,
 session, model, health, and toast calls as well as forwarded requests. Passwords are

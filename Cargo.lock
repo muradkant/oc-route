@@ -669,6 +669,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "json5",
+ "libc",
  "percent-encoding",
  "reqwest",
  "semver",

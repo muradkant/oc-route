@@ -30,6 +30,7 @@ semver = "1"
 base64 = "0.22"
 json5 = "1"
 tempfile = "3"
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

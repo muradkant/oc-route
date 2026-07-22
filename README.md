@@ -77,7 +77,8 @@ conversation and prose. Apply my intent when a message crosses categories.
 - `model_pool` contains the only valid destinations.
 - `router_model` makes the decision and does not need to be a destination.
 - `sliding_window` is 1–50 recent OpenCode messages.
-- `router_timeout_secs` is 1–600 seconds per attempt.
+- `router_timeout_secs` is a 1–600 second budget for the complete routing decision,
+  including any retry.
 
 Unknown fields, duplicate models, malformed IDs, empty policies, and out-of-range
 limits are rejected with profile-specific diagnostics. The interactive picker
@@ -109,7 +110,8 @@ work; an agent is only OpenCode's prompt/tool persona.
   converted into bounded routing hints. Private reasoning and bulky tool output
   are omitted.
 - Every attempt gets a fresh router session. A second fresh attempt covers
-  transport failures, malformed JSON, and choices outside the pool.
+  retryable transport failures, malformed JSON, and choices outside the pool;
+  errors OpenCode marks non-retryable fail open immediately.
 - A routing failure preserves the complete original request, including the model
   OpenCode or its client already selected. It never silently substitutes the first
   pool entry.
@@ -123,6 +125,8 @@ model cannot be changed retroactively. `oc-route` minimizes the surrounding work
 
 - OpenCode returns only the newest `sliding_window` messages;
 - router input text, tool hints, and rationale are bounded;
+- router requests disable optional model reasoning when OpenCode exposes a `none`
+  variant, avoiding hidden deliberation for a small JSON decision;
 - HTTP connections are pooled;
 - router sessions are created on demand—measured locally at roughly 18 ms—and
   deleted off the critical path;

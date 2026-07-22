@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Profile;
-use crate::oc_client::{OcClient, RouterSessions};
+use crate::oc_client::{OcClient, RouterPromptError, RouterSessions};
 use crate::router;
 
 pub type ProxyClient = Client<HttpConnector, Body>;
@@ -169,7 +169,14 @@ async fn intercept_prompt(State(state): State<AppState>, req: Request) -> Respon
     // covers exactly the routing window.
     let _routing_toast = state.oc.spawn_routing_toast("oc-route");
 
-    let routing_result = run_routing(&state, &session_id, prompt_parts).await;
+    // The profile timeout is one budget for the complete decision, including
+    // history lookup, session creation, inference, validation, and any retry. A
+    // slow first attempt must never silently double the user's maximum wait.
+    let routing_result = enforce_routing_deadline(
+        Duration::from_secs(state.profile.router_timeout_secs),
+        run_routing(&state, &session_id, prompt_parts),
+    )
+    .await;
 
     // Drop the animator BEFORE doing anything else. The guard's stop is reliable
     // (top-of-loop flag check), so no stray `Routing...` POST can fire after this to
@@ -349,12 +356,28 @@ async fn run_routing(
                 ));
             }
             Err(e) => {
+                let retryable = e
+                    .downcast_ref::<RouterPromptError>()
+                    .map(RouterPromptError::retryable)
+                    .unwrap_or(true);
                 tracing::warn!("run_routing: attempt {attempt} failed: {e}");
                 last_err = Some(e);
+                if !retryable {
+                    break;
+                }
             }
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("routing failed with no error captured")))
+}
+
+async fn enforce_routing_deadline<T>(
+    budget: Duration,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(budget, future)
+        .await
+        .map_err(|_| anyhow!("routing exceeded the total {budget:?} deadline"))?
 }
 
 fn parse_prompt_path(path: &str) -> Option<(String, &'static str)> {
@@ -442,6 +465,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn routing_deadline_bounds_the_complete_operation() {
+        let result = enforce_routing_deadline(Duration::from_millis(5), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("total 5ms deadline"));
+    }
 
     #[derive(Clone, Debug)]
     struct SeenRequest {
@@ -602,17 +639,20 @@ mod tests {
             "info": {
                 "error": {
                     "name": "ProviderAuthError",
-                    "data": { "message": "injected provider failure" }
+                    "data": {
+                        "message": "injected provider failure",
+                        "isRetryable": false
+                    }
                 }
             },
             "parts": []
         });
-        // Routing has one bounded retry, so make both attempts return OpenCode's
-        // successful-HTTP assistant-error shape.
+        // A non-retryable assistant error must fail open immediately rather than
+        // spending the user's time on a knowingly futile second request.
         mock.router_responses
             .lock()
             .unwrap()
-            .extend([assistant_error.clone(), assistant_error]);
+            .push_back(assistant_error);
         let original = json!({
             "parts": [{ "type": "text", "text": "keep this request intact" }],
             "model": { "providerID": "original", "modelID": "chosen" }
@@ -630,6 +670,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(mock.sessions.load(Ordering::SeqCst), 1);
 
         sessions.cleanup_all().await;
         let seen = mock.seen.lock().unwrap();
@@ -684,6 +725,7 @@ mod tests {
                 .unwrap();
             let router_body: Value = serde_json::from_slice(&router_prompt.body).unwrap();
             assert_eq!(router_body["agent"], "oc-route");
+            assert_eq!(router_body["variant"], "none");
             assert_eq!(router_body["tools"]["*"], false);
             assert!(router_body.get("system").is_none());
             assert!(router_body["parts"][0]["text"]

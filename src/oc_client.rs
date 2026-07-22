@@ -53,6 +53,30 @@ pub struct ModelInfo {
     pub name: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct RouterPromptError {
+    message: String,
+    retryable: bool,
+}
+
+impl RouterPromptError {
+    fn new(message: String, retryable: bool) -> Self {
+        Self { message, retryable }
+    }
+
+    pub fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+impl std::fmt::Display for RouterPromptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RouterPromptError {}
+
 impl OcClient {
     pub fn new(host: &str, port: u16) -> Self {
         let base = format!("http://{}:{}", host, port);
@@ -373,6 +397,10 @@ impl OcClient {
             "parts": [{ "type": "text", "text": routing_xml }],
             "model": { "providerID": provider, "modelID": model },
             "agent": "oc-route",
+            // OpenCode applies this only when the model exposes a `none` variant;
+            // otherwise it is a no-op. Routing needs a short JSON decision, not
+            // hidden chain-of-thought latency.
+            "variant": "none",
             "tools": { "*": false },
         });
         let req = self
@@ -386,7 +414,14 @@ impl OcClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("prompt_router: HTTP {}: {}", status, text);
+            let retryable = status.is_server_error()
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            return Err(RouterPromptError::new(
+                format!("prompt_router: HTTP {status}: {text}"),
+                retryable,
+            )
+            .into());
         }
         let val: Value = serde_json::from_str(&text)
             .with_context(|| format!("prompt_router: invalid JSON: {}", text))?;
@@ -395,7 +430,16 @@ impl OcClient {
             .and_then(|info| info.get("error"))
             .filter(|error| !error.is_null())
         {
-            anyhow::bail!("prompt_router: OpenCode reported an assistant error: {error}");
+            let retryable = error
+                .get("data")
+                .and_then(|data| data.get("isRetryable"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            return Err(RouterPromptError::new(
+                format!("prompt_router: OpenCode reported an assistant error: {error}"),
+                retryable,
+            )
+            .into());
         }
         let parts = val
             .get("parts")
