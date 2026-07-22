@@ -150,18 +150,10 @@ async fn create_profile_interactive(oc: &OcClient, theme: &ColorfulTheme) -> Res
         return Err(anyhow!("model pool cannot be empty"));
     }
 
-    // The router is infrastructure, not automatically a destination. Offer every
-    // connected model without forcing the selected router into `model_pool`.
-    let mut router_items: Vec<String> = if models.is_empty() {
-        model_pool.clone()
-    } else {
-        models.iter().map(full_model_id).collect()
-    };
-    router_items.sort();
-    router_items.dedup();
-    if models.is_empty() && !router_items.iter().any(|m| m == DEFAULT_ROUTER_MODEL) {
-        router_items.push(DEFAULT_ROUTER_MODEL.to_string());
-    }
+    // Keep the interactive flow scoped to the pool the user just chose. Profiles
+    // edited by hand may still use an independent router model, but setup must not
+    // unexpectedly reopen the full provider catalogue at this step.
+    let router_items = router_model_options(&model_pool);
     let router_default = router_items
         .iter()
         .position(|m| m == DEFAULT_ROUTER_MODEL)
@@ -277,6 +269,26 @@ fn full_model_id(m: &ModelInfo) -> String {
     format!("{}/{}", m.provider_id, m.id)
 }
 
+fn router_model_options(model_pool: &[String]) -> Vec<String> {
+    model_pool.to_vec()
+}
+
 pub fn flush_stdout() {
     let _ = std::io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::router_model_options;
+
+    #[test]
+    fn router_picker_contains_exactly_the_selected_pool() {
+        let pool = vec![
+            "opencode/deepseek-v4-flash-free".to_string(),
+            "opencode/laguna-s-2.1-free".to_string(),
+            "opencode/mimo-v2.5-free".to_string(),
+        ];
+
+        assert_eq!(router_model_options(&pool), pool);
+    }
 }
