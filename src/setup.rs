@@ -23,7 +23,7 @@ pub async fn run_setup(oc: &OcClient, profiles: &mut Profiles) -> Result<(Profil
 
     let profile = select_or_create_profile(oc, profiles, &theme).await?;
 
-    let mut sessions = oc.list_sessions().await.unwrap_or_default();
+    let mut sessions = oc.list_sessions().await?;
     // Drop oc-route's own throwaway router sessions so they never show up in the
     // picker and can never be picked as the "last conversation". They are created
     // and deleted on every routed message; if one lingers (e.g. a crashed run), it
@@ -43,7 +43,12 @@ pub async fn run_setup(oc: &OcClient, profiles: &mut Profiles) -> Result<(Profil
 /// True for oc-route's internal router sessions (title "oc-route-router"). These are
 /// short-lived scaffolding for routing decisions, never real conversations.
 fn is_router_session(s: &SessionInfo) -> bool {
-    s.title.as_deref() == Some("oc-route-router")
+    s.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("oc-route.internal"))
+        .and_then(|value| value.as_bool())
+        == Some(true)
+        || s.title.as_deref() == Some("oc-route-router")
 }
 
 /// Effective "last activity" timestamp for a session: prefer `time.updated`, fall
@@ -91,7 +96,9 @@ async fn select_or_create_profile(
         return Ok(profile);
     }
 
-    Ok(profiles.profiles[selection].clone())
+    let profile = profiles.profiles[selection].clone();
+    config::validate(&profile)?;
+    Ok(profile)
 }
 
 async fn create_profile_interactive(oc: &OcClient, theme: &ColorfulTheme) -> Result<Profile> {
@@ -99,7 +106,15 @@ async fn create_profile_interactive(oc: &OcClient, theme: &ColorfulTheme) -> Res
         .with_prompt("Profile name")
         .interact_text()?;
 
-    let models = oc.list_models().await.unwrap_or_default();
+    let models = match oc.list_models().await {
+        Ok(models) => models,
+        Err(error) => {
+            elog(format!(
+                "Warning: could not fetch models from OpenCode: {error}"
+            ));
+            Vec::new()
+        }
+    };
     let model_ids: Vec<String> = models.iter().map(model_display).collect();
     if model_ids.is_empty() {
         elog("Warning: could not fetch models from OpenCode. You can type model IDs manually.");
@@ -135,13 +150,16 @@ async fn create_profile_interactive(oc: &OcClient, theme: &ColorfulTheme) -> Res
         return Err(anyhow!("model pool cannot be empty"));
     }
 
-    // Router-model options: the pool plus the default router model, DEDUPLICATED.
-    // Without dedup, if the user already put DEFAULT_ROUTER_MODEL in their pool (which
-    // is natural — they're picking models they want to route among), it appeared twice
-    // in the picker. Dedup keeps first occurrence (pool order wins over the appended
-    // default) so the user sees each model exactly once.
-    let mut router_items: Vec<String> = model_pool.iter().cloned().collect();
-    if !router_items.iter().any(|m| m == DEFAULT_ROUTER_MODEL) {
+    // The router is infrastructure, not automatically a destination. Offer every
+    // connected model without forcing the selected router into `model_pool`.
+    let mut router_items: Vec<String> = if models.is_empty() {
+        model_pool.clone()
+    } else {
+        models.iter().map(full_model_id).collect()
+    };
+    router_items.sort();
+    router_items.dedup();
+    if models.is_empty() && !router_items.iter().any(|m| m == DEFAULT_ROUTER_MODEL) {
         router_items.push(DEFAULT_ROUTER_MODEL.to_string());
     }
     let router_default = router_items
@@ -154,9 +172,6 @@ async fn create_profile_interactive(oc: &OcClient, theme: &ColorfulTheme) -> Res
         .default(router_default)
         .interact()?;
     let router_model = router_items[router_idx].clone();
-    if !model_pool.contains(&router_model) {
-        model_pool.push(router_model.clone());
-    }
 
     let sliding_window: usize = Input::with_theme(theme)
         .with_prompt("Sliding window (number of recent messages sent to the router)")

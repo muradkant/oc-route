@@ -1,9 +1,14 @@
 [package]
 name = "oc-route"
-version = "0.1.0"
+version = "1.0.0-rc.1"
 edition = "2021"
 description = "OpenCode Model Router — a Rust proxy that routes each message to the optimal LLM based on user-defined natural language rules."
 license = "MIT"
+repository = "https://github.com/muradkant/oc-route"
+readme = "README.md"
+keywords = ["opencode", "llm", "router", "proxy"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -20,7 +25,17 @@ anyhow = "1"
 dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+percent-encoding = "2"
+semver = "1"
+base64 = "0.22"
+json5 = "1"
+tempfile = "3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = true
 codegen-units = 1
+panic = "abort"
+strip = true
