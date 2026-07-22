@@ -1,149 +1,180 @@
 # oc-route
 
-Choose a different OpenCode model for every message from rules written in plain
+[![CI](https://github.com/muradkant/oc-route/actions/workflows/ci.yml/badge.svg)](https://github.com/muradkant/oc-route/actions/workflows/ci.yml)
+
+Choose a different OpenCode model for each message using rules written in plain
 language.
 
 ```text
-"Use Sonnet for code review. Use model X when the conversation turns
-philosophical. Use model Y for casual writing."
+Use Sonnet for code review. Use DeepSeek when a conversation turns
+philosophical. Use a fast model for casual writing.
 ```
 
 `oc-route` is a Rust reverse proxy, not an OpenCode fork. It launches the real
-server and TUI, intercepts only prompt submission, asks a small router model to
-apply your rules, injects the chosen model, and forwards the original request.
-Sessions, tools, context, compaction, files, LSP, and streaming remain OpenCode's
-work.
+OpenCode server and TUI, intercepts only prompt submission, asks the configured
+router model to apply your policy, validates the answer, injects the selected
+model, and forwards the request. OpenCode still owns sessions, context,
+compaction, tools, files, LSP, providers, and generation.
+
+## Requirements
+
+- Linux x86-64;
+- OpenCode 1.17.7 or newer on `PATH`;
+- at least one connected OpenCode provider.
 
 ## Install
 
-Requirements:
+Download `oc-route-x86_64-linux` from the latest prerelease. It is one executable
+Linux ELF with no shared-library dependencies:
 
-- OpenCode 1.17.7+ on `PATH`, with at least one connected provider;
-- stable Rust.
+```sh
+install -Dm755 oc-route-x86_64-linux "$HOME/.local/bin/oc-route"
+```
+
+Or build from a clean checkout with stable Rust:
 
 ```sh
 git clone https://github.com/muradkant/oc-route.git
 cd oc-route
-cargo build --release
+cargo build --locked --release
 install -Dm755 target/release/oc-route "$HOME/.local/bin/oc-route"
 ```
 
-Run:
+## Use
+
+Run from the project whose OpenCode session you want:
 
 ```sh
 oc-route
 ```
 
 Choose or create a routing profile, then continue a real session or start a new
-one. You land in OpenCode's ordinary TUI. Each submitted message shows an
-animated routing toast; once the response arrives, an eight-second toast names
-the selected model and rationale.
-
-## Profile
+one. You enter OpenCode's ordinary TUI. Each text prompt shows a routing progress
+toast; the result toast names the chosen model and gives the router's short
+rationale. Attachment-only prompts remain untouched.
 
 Profiles live at `~/.config/oc-route/profiles.toml`:
 
 ```toml
 [[profile]]
 name = "coding-personal"
-router_model = "opencode/mimo-v2.5-free"
+router_model = "opencode/north-mini-code-free"
 sliding_window = 10
 router_timeout_secs = 90
 
 model_pool = [
   "anthropic/claude-sonnet-4-5",
   "openai/gpt-4o",
-  "opencode/nemotron-3-ultra-free",
 ]
 
 routing_prompt = """
-Use Claude for code. Use Nemotron for philosophy. Use GPT-4o for casual
-conversation. Apply my intent when a message crosses categories.
+Use Claude for code review and difficult implementation. Use GPT-4o for casual
+conversation and prose. Apply my intent when a message crosses categories.
 """
 ```
 
-- `routing_prompt` is the policy. Arbitrary, subjective criteria are the point.
+- `routing_prompt` is the user's entire subjective routing policy.
 - `model_pool` contains the only valid destinations.
-- `router_model` decides; keep it small and include it in the pool.
-- `sliding_window` limits recent conversation sent to the router.
-- `router_timeout_secs` bounds each router attempt.
+- `router_model` makes the decision and does not need to be a destination.
+- `sliding_window` is 1–50 recent OpenCode messages.
+- `router_timeout_secs` is 1–600 seconds per attempt.
 
-The interactive picker reads `/config/providers`, which lists models actually
-served by connected providers. It does not use the broader models.dev catalogue,
-whose entries may be unavailable locally.
+Unknown fields, duplicate models, malformed IDs, empty policies, and out-of-range
+limits are rejected with profile-specific diagnostics. The interactive picker
+uses `/config/providers`, so it offers models connected providers actually serve,
+not unavailable entries from the broader catalogue.
 
-## The routing tax
+## Dedicated router agent
 
-The decision must precede forwarding because OpenCode stores the model on the
-new user message; there is no retroactive switch endpoint. One router inference
-therefore sits on every message's critical path.
+The user's policy and the machine protocol have separate jobs. The profile says
+*how to choose*. A small internal protocol says to choose exactly one pool member,
+treat conversation text as untrusted data, and return a two-field JSON object.
 
-Measured on the same free endpoint and task:
+OpenCode normally prepends a full coding-agent prompt even when a request supplies
+its own system text. `oc-route` therefore adds a hidden, tool-free `oc-route` agent
+to the child server's in-memory configuration. It does not write OpenCode config,
+appear in the agent picker, or use the unrelated hidden `summary` agent.
 
-| Router | Latency | Valid decision |
-| --- | ---: | --- |
-| `nemotron-3-ultra-free` | 31–55 s | Yes |
-| `deepseek-v4-flash-free` | 11 s | Yes |
-| `mimo-v2.5-free` (default) | ~8 s | Yes |
-| `north-mini-code-free` | ~2 s | Yes |
+On the same live routing sample, OpenCode's default coding agent consumed 7,194
+input tokens, the earlier summary-agent experiment consumed 266, and the dedicated
+agent consumed 220. The configured `router_model` is still the model doing the
+work; an agent is only OpenCode's prompt/tool persona.
 
-`mimo-v2.5-free` balances speed with nuanced policy; simple rules may justify
-`north-mini-code-free`. Reasoning-effort variants did not change the dominant
-provider latency.
+## Correctness and failure behavior
 
-The proxy reduces its own contribution by asking OpenCode for only the newest
-N history messages, prefetched one-use router sessions, deleting used sessions
-off the critical path, reusing HTTP connections, and retrying one failed router
-call with a fresh session. It never caches a decision: every message receives a
-new judgment.
+- Both `POST /session/:id/prompt_async` and `POST /session/:id/message` route.
+- `GET /session/:id/message`, query strings, authentication, directory context,
+  SSE bodies, and all unrelated endpoints pass through.
+- Current OpenCode message, model, tool, file, agent, and subtask schemas are
+  converted into bounded routing hints. Private reasoning and bulky tool output
+  are omitted.
+- Every attempt gets a fresh router session. A second fresh attempt covers
+  transport failures, malformed JSON, and choices outside the pool.
+- A routing failure preserves the complete original request, including the model
+  OpenCode or its client already selected. It never silently substitutes the first
+  pool entry.
+- Internal sessions are tracked, retried on deletion failure, filtered from the
+  session picker, and drained during shutdown.
+
+## Performance
+
+The routing inference must finish before OpenCode creates the user message; the
+model cannot be changed retroactively. `oc-route` minimizes the surrounding work:
+
+- OpenCode returns only the newest `sliding_window` messages;
+- router input text, tool hints, and rationale are bounded;
+- HTTP connections are pooled;
+- router sessions are created on demand—measured locally at roughly 18 ms—and
+  deleted off the critical path;
+- the compact dedicated agent avoids thousands of irrelevant prompt tokens.
+
+No decision is cached: every text message receives a new judgment.
 
 ## Standalone proxy
 
-Against an existing server:
+To proxy an existing HTTP OpenCode server:
 
 ```sh
 oc-route proxy \
   --upstream http://127.0.0.1:4096 \
   --profile coding-personal \
+  --directory "$PWD" \
   --bind 127.0.0.1:4097
 ```
 
-Attach any compatible OpenCode client to the bind address.
+If that server already exposes the exact dedicated agent, it is reused. Otherwise
+`oc-route` starts one private OpenCode router sidecar with an isolated temporary database.
+The sidecar shares local provider configuration/authentication but cannot use
+credentials that exist only on a remote machine. Measured cold readiness ranged
+from roughly 1.7–3.7 seconds; its OpenCode runtime used about 300 MiB RSS before
+provider initialization and about 440 MiB afterward, while the Rust proxy used
+about 6 MiB. It persists for the proxy lifetime to avoid adding startup latency to
+every message, then exits with the proxy and removes its private database.
 
-## Boundaries worth preserving
-
-- Both `POST /session/:id/prompt_async` and `POST /session/:id/message` are
-  intercepted. `GET /session/:id/message` is history and must pass through;
-  registering a POST-only Axum route at that path would turn the GET into 405.
-- History remains in OpenCode. The proxy requests `?limit=N`, converts tool and
-  reasoning parts to concise XML hints, and preserves user/assistant text.
-- Working models receive the full OpenCode-managed conversation across model
-  changes; only provider-specific metadata is adapted by OpenCode.
-- Router sessions are hidden from continuation choices. “Continue” resolves to
-  the newest non-router session ID rather than trusting a transient newest
-  session.
-- Non-JSON prompts and routing failures are forwarded safely; model and
-  rationale are validated before injection.
-- The child server is health-monitored, and routing retry is bounded.
-
-See [Architecture](ARCHITECTURE.md) for the request path, concurrency, session
-ownership, protocol decisions, and verified invariants.
+Set `OPENCODE_SERVER_PASSWORD` for Basic authentication; pass `--username` only
+when the server does not use OpenCode's default username. Passwords are not accepted
+as command-line arguments because process arguments are commonly visible to other
+local users.
 
 ## Verify
 
+The deterministic suite is quota-free:
+
 ```sh
-cargo test --all-targets
-cargo clippy --all-targets
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
 ```
 
-The live harness starts a real OpenCode server and consumes configured provider
-quota:
+The live harness builds the release binary, creates isolated temporary profiles,
+selects a connected free model, drives a real asynchronous OpenCode prompt, checks
+model injection and cleanup, proves upstream config/provider state is unchanged,
+and deletes its disposable session:
 
 ```sh
 ./tests/integration.sh
 ```
 
-Set `RUST_LOG=oc_route=info` for proxy diagnostics. Logs use stderr so the
-fullscreen TUI keeps stdout.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for protocol and ownership details.
 
 MIT licensed.
